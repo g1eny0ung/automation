@@ -1,0 +1,79 @@
+name: Daily Market Analysis
+
+on:
+  schedule:
+    - cron: '0 9 * * 1-5'
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+jobs:
+  market-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate market analysis report
+        env:
+          MARKET_API_TOKEN: ${{ secrets.MARKET_API_TOKEN }}
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+        run: |
+          check_http() {
+            local label="$1" body="$2" code="$3"
+            if [ "$code" -ne 200 ]; then
+              echo "Error: $label (HTTP $code)"
+              echo "$body"
+              exit 1
+            fi
+          }
+
+          split_response() {
+            local raw="$1"
+            _HTTP_CODE=$(echo "$raw" | tail -1)
+            _BODY=$(echo "$raw" | head -n -1)
+          }
+
+          YESTERDAY=$(TZ=Asia/Shanghai date -d "yesterday" +"%Y-%m-%d")
+
+          echo "=== Fetching market data for $YESTERDAY ==="
+          split_response "$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $MARKET_API_TOKEN" \
+            "https://stock-analysis-umber.vercel.app/api/market-summary")"
+          check_http "Failed to fetch market data" "$_BODY" "$_HTTP_CODE"
+          MARKET_BODY="$_BODY"
+
+          echo "=== Building prompt ==="
+          PROMPT_TEMPLATE=$(cat market-analysis-daily-prompt.md)
+          PROMPT="${PROMPT_TEMPLATE//\[请填写日期\]/$YESTERDAY}"
+          PROMPT="${PROMPT//\[请在此处粘贴数据表格\]/$MARKET_BODY}"
+
+          echo "=== Calling AI API ==="
+          REQUEST_BODY=$(jq -n \
+            --arg model "deepseek-v4-flash-260425" \
+            --arg content "$PROMPT" \
+            '{
+              model: $model,
+              messages: [{ role: "user", content: $content }]
+            }')
+
+          split_response "$(echo "$REQUEST_BODY" | curl -s -w "\n%{http_code}" \
+            https://ark.cn-beijing.volces.com/api/v3/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $ARK_API_KEY" \
+            -d @-)"
+          check_http "Failed to get AI response" "$_BODY" "$_HTTP_CODE"
+          RESPONSE_BODY="$_BODY"
+
+          echo "=== Market Analysis Report ==="
+          REPORT=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // .')
+
+          echo "=== Token Usage ==="
+          echo "$RESPONSE_BODY" | jq '.usage'
+
+          echo "=== Storing report ==="
+          STORE_BODY=$(jq -n --arg summary "$REPORT" '{ summary: $summary }')
+          split_response "$(echo "$STORE_BODY" | curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $MARKET_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @- \
+            "https://stock-analysis-umber.vercel.app/api/reports/daily")"
+          check_http "Failed to store report" "$_BODY" "$_HTTP_CODE"
+          echo "Report stored successfully"
