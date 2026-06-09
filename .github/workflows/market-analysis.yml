@@ -39,6 +39,8 @@ jobs:
             "https://stock-analysis-umber.vercel.app/api/market-summary")"
           check_http "Failed to fetch market data" "$_BODY" "$_HTTP_CODE"
           MARKET_BODY="$_BODY"
+          echo "=== Market Data ==="
+          echo "$MARKET_BODY"
 
           echo "=== Building prompt ==="
           PROMPT_TEMPLATE=$(cat market-analysis-daily-prompt.md)
