@@ -45,11 +45,11 @@ jobs:
           echo "=== Building prompt ==="
           PROMPT_TEMPLATE=$(cat market-analysis-daily-prompt.md)
           PROMPT="${PROMPT_TEMPLATE//\[请填写日期\]/$YESTERDAY}"
-          PROMPT="${PROMPT//\[请在此处粘贴数据表格\]/$MARKET_BODY}"
+          PROMPT="${PROMPT//\[请在此处粘贴数据\]/$MARKET_BODY}"
 
           echo "=== Calling AI API ==="
           REQUEST_BODY=$(jq -n \
-            --arg model "deepseek-v4-flash-260425" \
+            --arg model "deepseek-v4-pro-260425" \
             --arg content "$PROMPT" \
             '{
               model: $model,
