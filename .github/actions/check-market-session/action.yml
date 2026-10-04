@@ -1,0 +1,31 @@
+name: Check market session
+description: Check whether any selected market is open.
+inputs:
+  markets:
+    description: Comma-separated market codes on one line, en or zh.
+    required: true
+  date:
+    description: Target date in Beijing time, today or yesterday.
+    required: true
+outputs:
+  should_run:
+    description: Whether at least one selected market is open.
+    value: ${{ steps.check.outputs.should_run }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.14'
+    - name: Install exchange calendar
+      shell: bash
+      run: python -m pip install -r requirements-market-calendar.txt
+    - name: Check selected markets
+      id: check
+      shell: bash
+      env:
+        MARKETS: ${{ inputs.markets }}
+        SESSION_DATE: ${{ inputs.date }}
+      run: |
+        set -euo pipefail
+        python scripts/market_session.py "$MARKETS" --date "$SESSION_DATE" --github-output "$GITHUB_OUTPUT"

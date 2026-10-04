@@ -10,13 +10,21 @@ jobs:
   market-analysis:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/check-market-session
+        id: session
+        with:
+          markets: en,zh
+          date: yesterday
 
       - name: Generate market analysis report
+        if: steps.session.outputs.should_run == 'true'
         env:
           MARKET_API_TOKEN: ${{ secrets.MARKET_API_TOKEN }}
           ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
         run: |
+          set -euo pipefail
+
           check_http() {
             local label="$1" body="$2" code="$3"
             if [ "$code" -ne 200 ]; then
@@ -35,17 +43,14 @@ jobs:
           YESTERDAY=$(TZ=Asia/Shanghai date -d "yesterday" +"%Y-%m-%d")
 
           echo "=== Fetching market data for $YESTERDAY ==="
-          split_response "$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $MARKET_API_TOKEN" \
-            "https://stock-analysis-umber.vercel.app/api/market-summary")"
-          check_http "Failed to fetch market data" "$_BODY" "$_HTTP_CODE"
-          MARKET_BODY="$_BODY"
+          MARKET_BODY="$(bash scripts/fetch-market-data.sh)"
           echo "=== Market Data ==="
           echo "$MARKET_BODY"
 
           echo "=== Building prompt ==="
           PROMPT_TEMPLATE=$(cat market-analysis-daily-prompt.md)
           PROMPT="${PROMPT_TEMPLATE//\[请填写日期\]/$YESTERDAY}"
-          PROMPT="${PROMPT//\[请在此处粘贴数据\]/$MARKET_BODY}"
+          PROMPT="${PROMPT//\[请在此处粘贴数据\]/"$MARKET_BODY"}"
 
           echo "=== Calling AI API ==="
           REQUEST_BODY=$(jq -n \
@@ -65,7 +70,12 @@ jobs:
           RESPONSE_BODY="$_BODY"
 
           echo "=== Market Analysis Report ==="
-          REPORT=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // .')
+          REPORT=$(echo "$RESPONSE_BODY" | jq -er '
+            .choices[0].message.content
+            | if type == "string" then
+                if test("\\S") then . else error("AI response has no report content") end
+              else error("AI response has no report content") end
+          ')
 
           echo "=== Token Usage ==="
           echo "$RESPONSE_BODY" | jq '.usage'
