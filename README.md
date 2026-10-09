@@ -39,6 +39,8 @@ Actions 使用本仓库的 [producer/](producer/) 运行广度刷新，不需要
 
 [stock-analysis-revision.txt](stock-analysis-revision.txt) 记录源代码的完整 commit SHA，[stock-analysis-bundle.json](stock-analysis-bundle.json) 记录同一版本和每个文件的 SHA-256。准备和运行时都会核对版本、文件清单和内容摘要，然后在 `producer/` 内用 Python 3.14 和 `uv sync --locked` 安装依赖。算法、目标日期、成分缓存、刷新锁和 Redis 发布均由原版 `scripts.refresh_market_breadth` 负责。
 
+A 股历史价格保存在 Redis。日常按每批 50 只获取腾讯当日收盘报价，距上次全量的目标交易日满 14 个自然日时重抓近 380 个自然日的历史。首次运行、历史缓存损坏、成分变化或漏掉交易日时也会全量抓取；同一目标日重跑复用已保存的数据。分红送股造成的暂时偏差在下一次全量时校正。摘要中的 `mode` 区分 `full`、`incremental` 和 `reuse`。美股仍批量读取 HF 历史数据。
+
 准备步骤包括交易日检查，最多 4 分钟。刷新进程组最多运行 14 分钟，发送 TERM 后最多再等 15 秒强杀；job 上限 20 分钟。任务不自动重试。失败后可查看最终摘要及 `breadth-en-*` 或 `breadth-zh-*` artifact，内含逐次尝试日志、汇总和成功时的完整快照。来源失败次数与最终失败股票数分开统计，备用来源成功不会增加失败股票数。发布响应丢失时，按日志中的本次 `refreshed_at`、内容摘要与 Redis 核对，不能只凭同日键存在就认为本次发布成功。
 
 更新 producer 时，先在 stock_analysis 部署相应缓存改动，把包含 CLI 的完整 commit SHA 写入版本文件，再从本地源仓库按固定清单导出。命令读取该提交的文件，不读取工作区改动。

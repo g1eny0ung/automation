@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, time as datetime_time, timedelta
 from io import BytesIO
 from typing import TYPE_CHECKING, Any
 
@@ -20,10 +24,12 @@ if TYPE_CHECKING:
 from lib.breadth_trace import RefreshTrace, observe
 from lib.constituent_cache import ConstituentCache
 from lib.market_snapshot_cache import (
+    BEIJING_TZ,
     MarketSnapshotCache,
     MarketSnapshotCacheConfig,
+    SnapshotRefreshResult,
 )
-from lib.utils.trading_calendar import MARKET_CN
+from lib.utils.trading_calendar import MARKET_CN, next_trading_day
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +43,8 @@ CSI300_MIN_VALID = 240
 HIST_FETCH_RETRIES = 2
 # 最多同时拉取 6 只股票的历史行情。
 FETCH_WORKERS = 6
+FULL_REFRESH_DAYS = 14
+QUOTE_BATCH_SIZE = 50
 
 REDIS_KEY_PREFIX = "market:zh-breadth:v2"
 REDIS_LOCK_TTL_SECONDS = 1200
@@ -53,6 +61,7 @@ _cache = MarketSnapshotCache(
         redis_lock_ttl_seconds=REDIS_LOCK_TTL_SECONDS,
         l1_max_age_seconds=300,
         publish_requires_lock=True,
+        refresh_state_key="market:zh-breadth:history:v1",
         # 目标日没有缓存时，最多查找此前 3 个交易日的缓存，长假期间也按交易日回退。
         read_fallback_trading_days=3,
         payload_data_error="Cached China breadth payload missing data object",
@@ -64,6 +73,167 @@ _cache = MarketSnapshotCache(
     ),
     logger,
 )
+
+
+@dataclass(frozen=True)
+class _HistoryState:
+    constituents: list[str]
+    last_full_refresh_date: date
+    asof: date
+    matrix: pd.DataFrame
+
+    @classmethod
+    def from_json(cls, value: Any) -> _HistoryState:
+        import pandas as pd
+
+        if not isinstance(value, dict) or value.get("version") != 1:
+            raise ValueError("Invalid breadth history version")
+        constituents = value["constituents"]
+        columns = value["columns"]
+        for symbols in (constituents, columns):
+            if (
+                not isinstance(symbols, list)
+                or not symbols
+                or any(
+                    not isinstance(symbol, str)
+                    or not re.fullmatch(r"[0-9]{6}", symbol)
+                    for symbol in symbols
+                )
+                or len(set(symbols)) != len(symbols)
+            ):
+                raise ValueError("Invalid breadth history symbols")
+        if len(constituents) < CSI300_MIN_VALID or not set(columns) <= set(constituents):
+            raise ValueError("Invalid breadth history constituents")
+        asof = date.fromisoformat(value["asof"])
+        last_full = date.fromisoformat(value["last_full_refresh_date"])
+        dates = [date.fromisoformat(day) for day in value["dates"]]
+        if (
+            not dates
+            or len(dates) > HIST_LOOKBACK_DAYS + 1
+            or dates != sorted(set(dates))
+            or dates[-1] != asof
+            or dates[0] < asof - timedelta(days=HIST_LOOKBACK_DAYS)
+            or last_full > asof
+        ):
+            raise ValueError("Invalid breadth history dates")
+        values = value["values"]
+        if not isinstance(values, list) or len(values) != len(dates):
+            raise ValueError("Invalid breadth history rows")
+        for row in values:
+            if not isinstance(row, list) or len(row) != len(columns):
+                raise ValueError("Invalid breadth history row width")
+            if any(
+                value is not None
+                and (type(value) not in (int, float) or not math.isfinite(value))
+                for value in row
+            ):
+                raise ValueError("Invalid breadth history close")
+        matrix = pd.DataFrame(
+            values, columns=columns, index=pd.to_datetime(dates), dtype=float
+        )
+        if int((matrix.iloc[-1] > 0).sum()) < CSI300_MIN_VALID:
+            raise ValueError("Insufficient breadth history target closes")
+        return cls(constituents, last_full, asof, matrix)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "constituents": self.constituents,
+            "last_full_refresh_date": self.last_full_refresh_date.isoformat(),
+            "asof": self.asof.isoformat(),
+            "dates": [day.date().isoformat() for day in self.matrix.index],
+            "columns": list(self.matrix.columns),
+            "values": (
+                self.matrix.astype(object).where(self.matrix.notna(), None).values.tolist()
+            ),
+        }
+
+
+def _fetch_latest_closes(
+    symbols: list[str], refresh_date: date, *, trace: RefreshTrace | None = None
+) -> dict[str, float]:
+    import requests
+
+    closes: dict[str, float] = {}
+    current = _cache.now().astimezone(BEIJING_TZ).replace(tzinfo=None)
+    with requests.Session() as session:
+        for offset in range(0, len(symbols), QUOTE_BATCH_SIZE):
+            batch = {
+                _tencent_symbol(symbol): symbol
+                for symbol in symbols[offset : offset + QUOTE_BATCH_SIZE]
+            }
+            for attempt in range(2):
+                try:
+                    with observe(
+                        trace,
+                        "source",
+                        "quotes",
+                        source="tencent_quotes",
+                        unit="http_request",
+                        batch_id=offset // QUOTE_BATCH_SIZE + 1,
+                        attempt=attempt + 1,
+                    ) as observation:
+                        observation["requested_count"] = len(batch)
+                        observation["valid_count"] = 0
+                        response = session.get(
+                            "https://qt.gtimg.cn/q=" + ",".join(batch), timeout=(5, 20)
+                        )
+                        response.raise_for_status()
+                        seen: dict[str, str] = {}
+                        conflicts: set[str] = set()
+                        for key, record in re.findall(
+                            r'v_([a-z]{2}[0-9]{6})="([^"\r\n]*)";', response.text
+                        ):
+                            if key not in batch:
+                                continue
+                            if key in seen and seen[key] != record:
+                                conflicts.add(key)
+                            seen[key] = record
+                            if key in conflicts:
+                                closes.pop(batch[key], None)
+                                continue
+                            fields = record.split("~")
+                            if (
+                                len(fields) <= 30
+                                or fields[2] != batch[key]
+                                or not re.fullmatch(r"[0-9]{14}", fields[30])
+                            ):
+                                continue
+                            try:
+                                price = float(fields[3])
+                                timestamp = datetime.strptime(fields[30], "%Y%m%d%H%M%S")
+                            except ValueError:
+                                continue
+                            if (
+                                math.isfinite(price)
+                                and price > 0
+                                and timestamp.date() == refresh_date
+                                and timestamp.time() >= datetime_time(15)
+                                and timestamp <= current
+                            ):
+                                closes[batch[key]] = price
+                        valid_count = sum(symbol in closes for symbol in batch.values())
+                        observation["valid_count"] = valid_count
+                        observation["missing_count"] = len(batch) - valid_count
+                        if not valid_count:
+                            raise ValueError(
+                                "Tencent quote batch has no valid target-day closes"
+                            )
+                    break
+                except (requests.RequestException, ValueError):
+                    if attempt == 1:
+                        logger.warning(
+                            "Tencent quote batch %s failed", offset // QUOTE_BATCH_SIZE + 1
+                        )
+                    else:
+                        time.sleep(CALL_INTERVAL_SECONDS)
+    if trace:
+        trace.emit("snapshot", quote_valid_count=len(closes))
+    if len(closes) < CSI300_MIN_VALID:
+        raise ValueError(
+            f"CSI300 target-day valid closes fewer than {CSI300_MIN_VALID}: {len(closes)}"
+        )
+    return closes
 
 
 def _csi300_symbols(*, trace: RefreshTrace | None = None) -> list[str]:
@@ -349,27 +519,102 @@ def _fetch_close_matrix(
 
 def _fetch_zh_breadth(
     refresh_date: date, *, trace: RefreshTrace | None = None
-) -> dict[str, Any]:
-    from lib.utils.market_metrics_utils import sma_breadth
+) -> SnapshotRefreshResult:
+    import pandas as pd
+
+    from lib.utils.market_metrics_utils import normalize_close_matrix, sma_breadth
 
     logger.debug("Fetching China market breadth for %s", refresh_date)
     symbols = _constituent_cache.get(lambda: _csi300_symbols(trace=trace), trace=trace)
-    close_matrix = _fetch_close_matrix(symbols, refresh_date, trace=trace)
+    raw_state = _cache.read_refresh_state()
+    state = None
+    reason = "cold"
+    if raw_state is not None:
+        try:
+            state = _HistoryState.from_json(raw_state)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            reason = "corrupt"
+            logger.warning("Invalid CSI300 history state; fetching full history")
+    mode = "full"
+    if state is not None:
+        if set(state.constituents) != set(symbols):
+            reason = "constituents_changed"
+        elif refresh_date < state.asof:
+            reason = "older_target"
+        elif refresh_date == state.asof:
+            mode, reason = "reuse", "same_target"
+        elif (refresh_date - state.last_full_refresh_date).days >= FULL_REFRESH_DAYS:
+            reason = "periodic"
+        elif next_trading_day(state.asof, MARKET_CN) != refresh_date:
+            reason = "missing_trading_days"
+        else:
+            mode, reason = "incremental", "next_trading_day"
+    if trace:
+        trace.emit(
+            "snapshot",
+            mode=mode,
+            reason=reason,
+            last_full_refresh_date=(
+                state.last_full_refresh_date.isoformat() if state else None
+            ),
+        )
+    if mode == "full":
+        close_matrix = _fetch_close_matrix(symbols, refresh_date, trace=trace)
+        last_full = refresh_date
+    elif mode == "incremental":
+        closes = _fetch_latest_closes(symbols, refresh_date, trace=trace)
+        close_matrix = pd.concat(
+            [
+                state.matrix,
+                pd.DataFrame([closes], index=pd.to_datetime([refresh_date])).reindex(
+                    columns=state.matrix.columns
+                ),
+            ]
+        )
+        last_full = state.last_full_refresh_date
+    else:
+        close_matrix = state.matrix
+        last_full = state.last_full_refresh_date
+
+    close_matrix = normalize_close_matrix(close_matrix)
+    close_matrix = close_matrix.loc[
+        (
+            close_matrix.index
+            >= pd.Timestamp(refresh_date - timedelta(days=HIST_LOOKBACK_DAYS))
+        )
+        & (close_matrix.index <= pd.Timestamp(refresh_date))
+    ]
+    close_matrix = close_matrix.replace([float("inf"), float("-inf")], float("nan"))
+    if pd.Timestamp(refresh_date) in close_matrix.index:
+        target_row = close_matrix.loc[pd.Timestamp(refresh_date)]
+        close_matrix.loc[pd.Timestamp(refresh_date)] = target_row.where(target_row > 0)
+    target_count = (
+        int((close_matrix.loc[pd.Timestamp(refresh_date)] > 0).sum())
+        if pd.Timestamp(refresh_date) in close_matrix.index
+        else 0
+    )
+    if trace:
+        trace.emit("snapshot", target_count=target_count, history_rows=len(close_matrix))
+    if target_count < CSI300_MIN_VALID:
+        raise ValueError(
+            f"CSI300 target-day valid closes fewer than {CSI300_MIN_VALID}: {target_count}"
+        )
     with observe(trace, "stage", "calculation"):
         breadth = sma_breadth(close_matrix)
     breadth["universe"] = "沪深300"
-    # 拉取失败的成分股不参与计算，并将 partial 设为 True，表示统计范围不完整。
-    breadth["partial"] = close_matrix.shape[1] < len(symbols)
-
-    # 实际数据日期与目标交易日不一致时，只记录警告，仍保存本次快照。
-    data_date = close_matrix.index.max().date() if len(close_matrix.index) else None
-    if data_date != refresh_date:
-        logger.warning(
-            "Breadth close data as-of %s differs from refresh_date %s",
-            data_date,
-            refresh_date,
+    breadth["partial"] = target_count < len(symbols)
+    new_state = _HistoryState(symbols, last_full, refresh_date, close_matrix).to_json()
+    if trace:
+        trace.emit(
+            "snapshot",
+            last_full_refresh_date=last_full.isoformat(),
+            state_bytes=len(
+                json.dumps(new_state, ensure_ascii=False, allow_nan=False).encode()
+            ),
         )
-    return breadth
+    return SnapshotRefreshResult(
+        breadth, new_state if state is None or refresh_date >= state.asof else None
+    )
 
 
 def fetch_zh_market_breadth() -> dict[str, Any]:

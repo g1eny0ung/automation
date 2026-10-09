@@ -154,7 +154,7 @@ def summarize(path: str | Path) -> dict[str, Any]:
                     slow.append(event)
             if event["kind"] == "source":
                 logical_calls.setdefault(event["source"], set()).add(
-                    (event["operation"], event.get("symbol"))
+                    (event["operation"], event.get("symbol"), event.get("batch_id"))
                 )
                 source = summary["sources"].setdefault(
                     event["source"],

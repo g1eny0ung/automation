@@ -1,12 +1,12 @@
 {
-  "revision": "08efbae61059a2d5f3d2161b0f568699a60a45b6",
+  "revision": "83d7dc0b4f17bea63f89d63162c196c9231caf92",
   "files": {
-    "lib/breadth_trace.py": "44843fd519d8e63bcc67f1dd22103499ee7b30e5ce0b57436c0650fda466416f",
+    "lib/breadth_trace.py": "2da309bcd4619c1aa2bf81e24000366d19c00c036c49efa5e014c7a74b527f52",
     "lib/constituent_cache.py": "6bb61ec063eab5814e9ede9e2f0641cbb4fbca59bb0970ff8017c72cfd728bd7",
     "lib/json_cache.py": "b882c81737630f2221d6992844f475190643e78389d1bd6407f59c6b29c9038b",
     "lib/market_breadth_en.py": "51b6ad67f940f4f9ffb03639817b3cbf607a6b71b19e6b41bdae01719bec6771",
-    "lib/market_breadth_zh.py": "fcb1052b421a193e4533b0afd728c7d9da63d85a594b74501ae66c68874c8f70",
-    "lib/market_snapshot_cache.py": "a6ce3200a8a5ee0ab358c74b063ee5e484f962cf57eac57061e76a8459db0cf2",
+    "lib/market_breadth_zh.py": "53cb982a63479a0169282bf2c2edfbd9421967db47ba17eacba536d8ca32308c",
+    "lib/market_snapshot_cache.py": "54fe86c1734b6b897b6ebdb0336dd654f297c2a21feb90d16e538f26b61180ab",
     "lib/market_volatility.py": "c7f2c91c7470622feffba6b3c08675fba95a9436ac016e1d39817340a2ce845b",
     "lib/utils/market_metrics_utils.py": "ed498ded0ded1af6add38501e472ff652bb26c80eaa26a4bc3cb73e55d369d82",
     "lib/utils/json_utils.py": "4948fd4f0d74493d4d76ff84bbe193c3e0a3f959940533d0d5e585f3db5c5984",

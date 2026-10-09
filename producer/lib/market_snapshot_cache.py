@@ -42,6 +42,13 @@ class MarketSnapshotCacheConfig:
     read_fallback_trading_days: int = 0
     l1_max_age_seconds: int | None = None
     publish_requires_lock: bool = False
+    refresh_state_key: str | None = None
+
+
+@dataclass(frozen=True)
+class SnapshotRefreshResult:
+    data: dict[str, Any]
+    state: dict[str, Any] | None = None
 
 
 class MarketSnapshotCache:
@@ -55,6 +62,19 @@ class MarketSnapshotCache:
                 redis_ttl_seconds=config.redis_ttl_seconds,
             )
         )
+
+    def read_refresh_state(self) -> Any:
+        key = self.config.refresh_state_key
+        if key is None:
+            return None
+        raw = self._cache.get_redis_client().get(key)
+        if raw is None or isinstance(raw, dict):
+            return raw
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError, UnicodeDecodeError):
+            self.logger.warning("Invalid refresh state at %s", key)
+            return raw
 
     def reset_l1_cache(self) -> None:
         self._cache.reset_l1_cache()
@@ -209,7 +229,7 @@ class MarketSnapshotCache:
 
     def refresh(
         self,
-        fetch_records: Callable[[date], dict[str, Any]],
+        fetch_records: Callable[[date], dict[str, Any] | SnapshotRefreshResult],
         current: datetime | None = None,
         include_metadata: bool = False,
         trace: RefreshTrace | None = None,
@@ -231,7 +251,18 @@ class MarketSnapshotCache:
 
         try:
             with observe(trace, "stage", "fetch_and_calculate"):
-                records = fetch_records(refresh_date)
+                result = fetch_records(refresh_date)
+                if not isinstance(result, SnapshotRefreshResult):
+                    result = SnapshotRefreshResult(result)
+                records = result.data
+            state_json = None
+            if result.state is not None:
+                if (
+                    not self.config.refresh_state_key
+                    or not self.config.publish_requires_lock
+                ):
+                    raise ValueError("Refresh state requires a key and locked publication")
+                state_json = json.dumps(result.state, ensure_ascii=False, allow_nan=False)
             # refreshed_at 与 L1 TTL 以完成时刻计算。
             completed_at = self.now()
             payload = self.build_payload(records, refresh_date, completed_at)
@@ -249,19 +280,25 @@ class MarketSnapshotCache:
             with observe(trace, "stage", "redis_publication") as publication:
                 try:
                     if self.config.publish_requires_lock:
+                        keys = [
+                            f"{self.config.redis_key_prefix}:refresh-lock",
+                            self.redis_key(refresh_date),
+                        ]
+                        args = [
+                            lock_token,
+                            json.dumps(payload, ensure_ascii=False, allow_nan=False),
+                            str(self.redis_ttl_seconds(refresh_date, completed_at)),
+                        ]
+                        if state_json is not None:
+                            keys.append(self.config.refresh_state_key)
+                            args.append(state_json)
                         published = self._cache.get_redis_client().eval(
                             "if redis.call('get', KEYS[1]) == ARGV[1] then "
                             "redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3]); "
+                            "if #KEYS == 3 then redis.call('set', KEYS[3], ARGV[4]); end; "
                             "return 1 else return 0 end",
-                            keys=[
-                                f"{self.config.redis_key_prefix}:refresh-lock",
-                                self.redis_key(refresh_date),
-                            ],
-                            args=[
-                                lock_token,
-                                json.dumps(payload, ensure_ascii=False),
-                                str(self.redis_ttl_seconds(refresh_date, completed_at)),
-                            ],
+                            keys=keys,
+                            args=args,
                         )
                     else:
                         self._cache.redis_set_json(
