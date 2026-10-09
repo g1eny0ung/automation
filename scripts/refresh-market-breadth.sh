@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-exec python "$root/scripts/run_market_breadth.py" "$@"
+cd "$root"
+exec python -m scripts.run_market_breadth "$@"

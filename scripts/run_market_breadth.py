@@ -4,10 +4,11 @@ import argparse
 import json
 import os
 from pathlib import Path
-import re
 import signal
 import subprocess
 import time
+
+from scripts.breadth_bundle import verify
 
 
 def run(
@@ -67,15 +68,8 @@ def main() -> int:
     code = 1
     started = time.monotonic()
     try:
-        revision = (root / "stock-analysis-revision.txt").read_text().strip()
-        if not re.fullmatch(r"[0-9a-f]{40}", revision):
-            raise ValueError("Producer revision must be a full commit SHA")
-        checkout = Path(os.environ["RUNNER_TEMP"]) / "stock-analysis"
-        actual = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
-        ).strip()
-        if actual != revision:
-            raise ValueError("Producer checkout does not match the pinned revision")
+        revision = verify(root)
+        checkout = root / "producer"
         for name in ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"):
             if not os.environ.get(name):
                 raise ValueError(f"{name} is required")

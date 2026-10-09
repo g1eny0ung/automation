@@ -25,9 +25,6 @@ jobs:
       - uses: ./.github/actions/prepare-breadth
         id: prepare
         timeout-minutes: 4
-        env:
-          GITLAB_DEPLOY_USER: ${{ secrets.GITLAB_DEPLOY_USER }}
-          GITLAB_DEPLOY_TOKEN: ${{ secrets.GITLAB_DEPLOY_TOKEN }}
         with:
           market: en
           date: yesterday

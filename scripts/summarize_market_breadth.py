@@ -20,7 +20,7 @@ def main() -> None:
     output = temporary / f"breadth-{args.market}"
     output.mkdir(parents=True, exist_ok=True)
     summary = {"status": "missing_log"}
-    module = temporary / "stock-analysis/lib/breadth_trace.py"
+    module = Path(__file__).resolve().parents[1] / "producer/lib/breadth_trace.py"
     if module.exists():
         try:
             spec = importlib.util.spec_from_file_location("breadth_trace", module)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -23,18 +24,24 @@ class RunnerTests(unittest.TestCase):
         self.folder = Path(self.temporary.name).resolve()
         self.bin = self.folder / "bin"
         self.bin.mkdir()
-        self.checkout = self.folder / "stock-analysis"
-        self.checkout.mkdir()
+        self.root = self.folder / "automation"
+        self.root.mkdir()
+        for name in ("scripts", "producer"):
+            shutil.copytree(
+                ROOT / name,
+                self.root / name,
+                ignore=shutil.ignore_patterns(".venv", "__pycache__"),
+            )
+        for name in ("stock-analysis-revision.txt", "stock-analysis-bundle.json"):
+            shutil.copyfile(ROOT / name, self.root / name)
+        self.checkout = self.root / "producer"
         self.revision = (ROOT / "stock-analysis-revision.txt").read_text().strip()
         self.env = {
             **os.environ,
             "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
             "RUNNER_TEMP": str(self.folder),
             "TEST_LOG": str(self.folder / "calls.jsonl"),
-            "TEST_REVISION": self.revision,
             "TEST_EXIT": "0",
-            "GITLAB_DEPLOY_USER": "readonly-test-user",
-            "GITLAB_DEPLOY_TOKEN": "private-test-token",
             "UPSTASH_REDIS_REST_URL": "https://redis.example",
             "UPSTASH_REDIS_REST_TOKEN": "redis-test-token",
         }
@@ -42,23 +49,7 @@ class RunnerTests(unittest.TestCase):
             "python",
             f"#!{sys.executable}\nimport os,sys\nos.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n",
         )
-        self.executable(
-            "git",
-            f"""#!{sys.executable}
-import json, os, subprocess, sys
-from pathlib import Path
-args = sys.argv[1:]
-with open(os.environ['TEST_LOG'], 'a') as log:
-    log.write(json.dumps(args) + '\\n')
-if 'fetch' in args:
-    for prompt, expected in [('Username', 'GITLAB_DEPLOY_USER'), ('Password', 'GITLAB_DEPLOY_TOKEN')]:
-        actual = subprocess.check_output([os.environ['GIT_ASKPASS'], prompt], text=True).strip()
-        if actual != os.environ[expected]:
-            sys.exit(12)
-if 'rev-parse' in args:
-    print(os.environ['TEST_REVISION'])
-""",
-        )
+        self.executable("git", "#!/bin/sh\necho FORBIDDEN_GIT >&2\nexit 99\n")
         self.executable(
             "uv",
             f"""#!{sys.executable}
@@ -82,7 +73,7 @@ sys.exit(int(os.environ['TEST_EXIT']))
 
     def invoke(self, script, *args):
         return subprocess.run(
-            ["bash", str(ROOT / "scripts" / script), *args],
+            ["bash", str(self.root / "scripts" / script), *args],
             env=self.env,
             capture_output=True,
             text=True,
@@ -96,36 +87,43 @@ sys.exit(int(os.environ['TEST_EXIT']))
             else []
         )
 
-    def test_private_checkout_pins_exact_sha_askpass_never_logs_credentials(self):
+    def test_bundled_producer_prepares_without_gitlab_or_git(self):
         result = self.invoke("prepare-market-breadth.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.calls()
-        self.assertIn(
-            [
-                "-C",
-                str(self.checkout),
-                "-c",
-                "credential.helper=",
-                "fetch",
-                "--quiet",
-                "--depth=1",
-                "origin",
-                self.revision,
-            ],
-            calls,
-        )
         self.assertEqual(
-            calls[-1],
-            ["uv", str(self.checkout), "sync", "--locked", "--python", "3.14"],
+            self.calls(),
+            [["uv", str(self.checkout), "sync", "--locked", "--python", "3.14"]],
         )
-        logged = result.stdout + result.stderr + json.dumps(calls)
-        self.assertNotIn("private-test-token", logged)
-        self.assertNotIn("readonly-test-user", logged)
-        self.assertEqual(list(self.folder.glob("breadth-askpass.*")), [])
-        self.env["TEST_REVISION"] = "0" * 40
+        self.assertIn(self.revision, result.stdout)
+
+    def test_tampered_bundle_rejected_before_install_or_computation(self):
+        (self.checkout / "lib/market_breadth_en.py").write_text(
+            "raise RuntimeError('tampered')\n"
+        )
+        for script, args in [
+            ("prepare-market-breadth.sh", ()),
+            ("refresh-market-breadth.sh", ("en",)),
+        ]:
+            result = self.invoke(script, *args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("hash mismatch", result.stdout + result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_unlisted_files_and_changed_manifest_are_rejected(self):
+        extra = self.checkout / ".env"
+        extra.write_text("PRIVATE=value\n")
         result = self.invoke("prepare-market-breadth.sh")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("does not match", result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unlisted producer file", result.stderr)
+        extra.unlink()
+        path = self.root / "stock-analysis-bundle.json"
+        manifest = json.loads(path.read_text())
+        manifest["files"]["extra.py"] = "0" * 64
+        path.write_text(json.dumps(manifest))
+        result = self.invoke("prepare-market-breadth.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("allowlist", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_both_markets_call_pinned_cli_and_preserve_exit_codes(self):
         for market, code in [("zh", 0), ("en", 3), ("zh", 17)]:
@@ -160,11 +158,11 @@ sys.exit(int(os.environ['TEST_EXIT']))
     def test_invalid_market_revision_and_missing_redis_stop_before_computation(self):
         result = self.invoke("refresh-market-breadth.sh", "invalid")
         self.assertEqual(result.returncode, 2)
-        self.env["TEST_REVISION"] = "0" * 40
+        (self.root / "stock-analysis-revision.txt").write_text("0" * 40)
         result = self.invoke("refresh-market-breadth.sh", "en")
         self.assertEqual(result.returncode, 1)
         self.assertIn("does not match", result.stdout)
-        self.env["TEST_REVISION"] = self.revision
+        (self.root / "stock-analysis-revision.txt").write_text(self.revision)
         self.env["UPSTASH_REDIS_REST_TOKEN"] = ""
         result = self.invoke("refresh-market-breadth.sh", "en")
         self.assertEqual(result.returncode, 1)
@@ -172,11 +170,12 @@ sys.exit(int(os.environ['TEST_EXIT']))
         self.assertFalse(any(call[0] == "uv" for call in self.calls()))
 
     def test_setup_failure_summary_requires_no_producer_or_dependencies(self):
+        shutil.rmtree(self.checkout)
         self.env["GITHUB_STEP_SUMMARY"] = str(self.folder / "job-summary.md")
         result = subprocess.run(
             [
                 sys.executable,
-                str(ROOT / "scripts/summarize_market_breadth.py"),
+                str(self.root / "scripts/summarize_market_breadth.py"),
                 "zh",
                 "--preparation",
                 "failure",
@@ -196,14 +195,25 @@ sys.exit(int(os.environ['TEST_EXIT']))
         )
 
     def test_timeout_summary_keeps_partial_evidence_and_process_wall_time(self):
-        library = self.checkout / "lib"
-        library.mkdir()
-        (library / "breadth_trace.py").write_text(
-            "def summarize(path):\n"
-            "    return {'status': 'interrupted', 'observed_wall_seconds': 1, 'unfinished': [{'source': 'eastmoney', 'symbol': '600519'}]}\n"
-        )
         output = self.folder / "breadth-zh"
         output.mkdir()
+        (output / "events.jsonl").write_text(
+            json.dumps({"event": "run_start", "wall_seconds": 0, "market": "zh"})
+            + "\n"
+            + json.dumps(
+                {
+                    "event": "start",
+                    "wall_seconds": 1,
+                    "id": 1,
+                    "kind": "source",
+                    "unit": "symbol",
+                    "operation": "history",
+                    "source": "eastmoney",
+                    "symbol": "600519",
+                }
+            )
+            + "\n"
+        )
         (output / "runner.json").write_text(
             json.dumps({"exit_code": 124, "process_wall_seconds": 855.0})
         )
@@ -211,7 +221,7 @@ sys.exit(int(os.environ['TEST_EXIT']))
             [
                 sys.executable,
                 "-I",
-                str(ROOT / "scripts/summarize_market_breadth.py"),
+                str(self.root / "scripts/summarize_market_breadth.py"),
                 "zh",
                 "--preparation",
                 "success",
@@ -229,9 +239,9 @@ sys.exit(int(os.environ['TEST_EXIT']))
         self.assertEqual(summary["status"], "timeout")
         self.assertEqual(summary["process_wall_seconds"], 855.0)
         self.assertEqual(summary["observed_wall_seconds"], 1)
-        self.assertEqual(
-            summary["unfinished"], [{"source": "eastmoney", "symbol": "600519"}]
-        )
+        self.assertEqual(len(summary["unfinished"]), 1)
+        self.assertEqual(summary["unfinished"][0]["source"], "eastmoney")
+        self.assertEqual(summary["unfinished"][0]["symbol"], "600519")
 
     def test_missing_log_and_closed_market_summary_are_explicit(self):
         for should_run, expected in [
@@ -242,7 +252,7 @@ sys.exit(int(os.environ['TEST_EXIT']))
                 [
                     sys.executable,
                     "-I",
-                    str(ROOT / "scripts/summarize_market_breadth.py"),
+                    str(self.root / "scripts/summarize_market_breadth.py"),
                     "en",
                     "--preparation",
                     "success",
@@ -315,6 +325,7 @@ sys.exit(int(os.environ['TEST_EXIT']))
             )
             prepare = next(step for step in workflow if step.get("id") == "prepare")
             self.assertLess(prepare["timeout-minutes"] * 60 + 840 + 15, 20 * 60)
+            self.assertNotIn("env", prepare)
             refresh = next(step for step in workflow if step.get("id") == "refresh")
             self.assertEqual(
                 set(refresh["env"]),
