@@ -8,8 +8,8 @@
 
 | 任务                                                            | 运行时间         | 检查哪天是否开市 |
 | --------------------------------------------------------------- | ---------------- | ---------------- |
-| [刷新A股广度](.github/workflows/refresh-market-breadth-zh.yml)  | 每天 18:07       | 今天             |
-| [刷新美股广度](.github/workflows/refresh-market-breadth-en.yml) | 每天 10:17       | 昨天             |
+| [刷新A股广度](.github/workflows/refresh-market-breadth-zh.yml)  | 周一至周五 18:07       | 今天             |
+| [刷新美股广度](.github/workflows/refresh-market-breadth-en.yml) | 周二至周六 10:17       | 昨天             |
 | [生成日报](.github/workflows/market-analysis.yml)               | 周二至周六 09:00 | 两个市场的昨天   |
 
 广度任务遇到休市就跳过。日报只有在两个市场都休市时才跳过。手动运行也按表中的日期检查。
@@ -26,10 +26,22 @@
 
 | Secret             | 用途                             |
 | ------------------ | -------------------------------- |
-| `MARKET_API_TOKEN` | 访问市场数据接口，三个任务都需要 |
+| `MARKET_API_TOKEN` | 日报访问市场数据接口 |
+| `GITLAB_DEPLOY_USER` | GitLab 专用 deploy token 的用户名，广度任务需要 |
+| `GITLAB_DEPLOY_TOKEN` | GitLab 专用 deploy token，授予 stock_analysis 的 `read_repository` 权限 |
+| `UPSTASH_REDIS_REST_URL` | 广度任务使用的现有 Redis REST 地址 |
+| `UPSTASH_REDIS_REST_TOKEN` | 广度任务读取成分缓存、取得刷新锁并写快照的 Redis 令牌 |
 | `ARK_API_KEY`      | 调用 AI 模型，仅日报需要         |
 
 工作流在默认分支上自动运行。手动运行时，在 GitHub 的 Actions 页面选择任务，点击 **Run workflow**。结果和报错都在任务日志中。
+
+## 广度刷新
+
+Actions 使用 [stock-analysis-revision.txt](stock-analysis-revision.txt) 中的完整 commit SHA 拉取私有 GitLab `g1eny0ung/stock_analysis`，核对实际版本后，用 Python 3.14 和 `uv sync --locked` 安装其依赖。凭据经临时 `GIT_ASKPASS` 提供，远程地址不包含 token。算法、目标日期、成分缓存、刷新锁和 Redis 发布均由该版本的 `scripts.refresh_market_breadth` 负责。
+
+准备步骤包括交易日检查，最多 4 分钟。刷新进程组最多运行 14 分钟，发送 TERM 后最多再等 15 秒强杀；job 上限 20 分钟。任务不自动重试。失败后可查看最终摘要及 `breadth-en-*` 或 `breadth-zh-*` artifact，内含逐次尝试日志、汇总和成功时的完整快照。来源失败次数与最终失败股票数分开统计，备用来源成功不会增加失败股票数。发布响应丢失时，按日志中的本次 `refreshed_at`、内容摘要与 Redis 核对，不能只凭同日键存在就认为本次发布成功。
+
+更新 producer 时，先在 stock_analysis 部署刷新锁和缓存改动，再把完整 commit SHA 写入版本文件。配置上面的 GitLab 与 Redis secrets，先在迁移分支手动运行两个广度 workflow，核对日志、Redis 和 GET 返回的同一份快照，再合并到默认分支切换定时路径。现有 POST 仍可用于人工刷新。版本文件必须指向包含 CLI 的提交。
 
 ## 本地检查
 

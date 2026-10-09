@@ -1,0 +1,29 @@
+name: Prepare breadth refresh
+description: Check the market session and install the pinned breadth producer.
+inputs:
+  market:
+    required: true
+    description: Market code, en or zh.
+  date:
+    required: true
+    description: Calendar date, today or yesterday.
+outputs:
+  should_run:
+    value: ${{ steps.session.outputs.should_run }}
+    description: Whether the selected market was open.
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/check-market-session
+      id: session
+      with:
+        markets: ${{ inputs.market }}
+        date: ${{ inputs.date }}
+    - uses: astral-sh/setup-uv@v6
+      if: steps.session.outputs.should_run == 'true'
+      with:
+        enable-cache: false
+    - name: Prepare pinned producer
+      if: steps.session.outputs.should_run == 'true'
+      shell: bash
+      run: bash scripts/prepare-market-breadth.sh

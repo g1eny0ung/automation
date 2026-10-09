@@ -22,14 +22,37 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/check-market-session
-        id: session
+      - uses: ./.github/actions/prepare-breadth
+        id: prepare
+        timeout-minutes: 4
+        env:
+          GITLAB_DEPLOY_USER: ${{ secrets.GITLAB_DEPLOY_USER }}
+          GITLAB_DEPLOY_TOKEN: ${{ secrets.GITLAB_DEPLOY_TOKEN }}
         with:
-          markets: en
+          market: en
           date: yesterday
       - name: Refresh cached breadth snapshot
-        if: steps.session.outputs.should_run == 'true'
+        id: refresh
+        if: steps.prepare.outputs.should_run == 'true'
         shell: bash
         env:
-          MARKET_API_TOKEN: ${{ secrets.MARKET_API_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: bash scripts/refresh-market-breadth.sh en
+      - name: Summarize breadth refresh
+        if: always()
+        shell: bash
+        env:
+          PREPARATION: ${{ steps.prepare.outcome }}
+          REFRESH: ${{ steps.refresh.outcome }}
+          SHOULD_RUN: ${{ steps.prepare.outputs.should_run }}
+        run: >-
+          python scripts/summarize_market_breadth.py en
+          --preparation "$PREPARATION" --refresh "$REFRESH" --should-run "$SHOULD_RUN"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: breadth-en-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/breadth-en/
+          if-no-files-found: warn
+          retention-days: 14

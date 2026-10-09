@@ -200,10 +200,10 @@ class GateTests(unittest.TestCase):
                 {"market": "zh", "date": "2026-10-07", "status": "closed"},
             ]),
         ):
-            session = next(step for step in steps(f".github/workflows/{filename}") if step.get("id") == "session")["with"]
+            session = next(step for step in steps(f".github/workflows/{filename}") if step.get("id") in ("session", "prepare"))["with"]
             for hour in ("07:59:59", "18:00:00"):
                 with self.subTest(workflow=filename, hour=hour), tempfile.TemporaryDirectory() as directory:
-                    result, output = run_gate(Path(directory), session["markets"], session["date"], f"2026-10-08T{hour}+08:00")
+                    result, output = run_gate(Path(directory), session.get("markets", session.get("market")), session["date"], f"2026-10-08T{hour}+08:00")
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(json.loads(result.stdout), expected)
                     self.assertEqual(output, "should_run=true\n")
@@ -258,12 +258,11 @@ class GateTests(unittest.TestCase):
         ):
             with self.subTest(workflow=filename):
                 workflow = steps(f".github/workflows/{filename}")
-                session = next(step for step in workflow if step.get("id") == "session")
+                session = next(step for step in workflow if step.get("id") in ("session", "prepare"))
                 business = next(step for step in workflow if step.get("name") == business_name)
-                self.assertEqual(session, {
-                    "uses": "./.github/actions/check-market-session", "id": "session", "with": {"markets": markets, "date": selection},
-                })
-                self.assertEqual(business["if"], "steps.session.outputs.should_run == 'true'")
+                self.assertEqual(session["with"]["date"], selection)
+                self.assertEqual(session["with"].get("markets", session["with"].get("market")), markets)
+                self.assertEqual(business["if"], f"steps.{session['id']}.outputs.should_run == 'true'")
                 if command:
                     self.assertEqual(business["run"], command)
         import yaml
@@ -276,91 +275,6 @@ class GateTests(unittest.TestCase):
         self.assertEqual(check["env"], {"MARKETS": "${{ inputs.markets }}", "SESSION_DATE": "${{ inputs.date }}"})
         self.assertEqual(install["shell"], "bash")
         self.assertEqual(check["shell"], "bash")
-
-
-class BreadthTests(unittest.TestCase):
-    def run_breadth(self, *markets, token="test-token", http="200", curl_exit="0", stale=False):
-        with tempfile.TemporaryDirectory() as directory:
-            folder = Path(directory)
-            curl = folder / "curl"
-            curl.write_text(textwrap.dedent(f"""\
-                #!{sys.executable}
-                import json
-                import os
-                from pathlib import Path
-                import sys
-                args = sys.argv[1:]
-                with open(os.environ["TEST_CURL_LOG"], "a") as log:
-                    log.write(json.dumps(args) + "\\n")
-                Path(args[args.index("--output") + 1]).write_text(json.dumps({{
-                    "refresh_date": "2026-10-08",
-                    "data": {{"date": os.environ["TEST_DATA_DATE"], "partial": False}},
-                    "refreshed_at": "2026-10-08T18:07:00+08:00",
-                }}))
-                print(os.environ["TEST_HTTP"], end="")
-                sys.exit(int(os.environ["TEST_CURL_EXIT"]))
-                """))
-            curl.chmod(0o755)
-            log = folder / "curl.jsonl"
-            env = {
-                **os.environ,
-                "PATH": str(folder) + os.pathsep + os.environ["PATH"],
-                "RUNNER_TEMP": str(folder),
-                "MARKET_API_TOKEN": token,
-                "TEST_CURL_LOG": str(log),
-                "TEST_HTTP": http,
-                "TEST_CURL_EXIT": curl_exit,
-                "TEST_DATA_DATE": "2026-10-07" if stale else "2026-10-08",
-            }
-            result = subprocess.run(["bash", "scripts/refresh-market-breadth.sh", *markets], cwd=ROOT, env=env, capture_output=True, text=True)
-            calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-            return result, calls
-
-    def test_post_and_response_summary(self):
-        for market in ("en", "zh"):
-            with self.subTest(market=market):
-                result, calls = self.run_breadth(market)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertTrue(result.stdout.startswith("HTTP 200\n"))
-                self.assertEqual(json.loads(result.stdout.removeprefix("HTTP 200\n")), {
-                    "refresh_date": "2026-10-08", "data_date": "2026-10-08",
-                    "refreshed_at": "2026-10-08T18:07:00+08:00", "partial": False,
-                })
-                self.assertEqual(len(calls), 1)
-                args = calls[0]
-                self.assertEqual(args[-1], f"https://stock-analysis-umber.vercel.app/api/market-breadth/{market}")
-                for flag, value in (("--request", "POST"), ("--header", "Authorization: Bearer test-token"), ("--connect-timeout", "15"), ("--max-time", "900")):
-                    self.assertEqual(args[args.index(flag) + 1], value)
-                self.assertEqual(Path(args[args.index("--output") + 1]).name, f"breadth-{market}.json")
-
-    def test_invalid_market_and_missing_token_stop_before_request(self):
-        for markets in ((), ("invalid",), ("en", "zh")):
-            with self.subTest(markets=markets):
-                result, calls = self.run_breadth(*markets)
-                self.assertEqual(result.returncode, 1)
-                self.assertTrue(result.stderr.strip())
-                self.assertEqual(calls, [])
-        for market in ("en", "zh"):
-            result, calls = self.run_breadth(market, token="")
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("MARKET_API_TOKEN is required", result.stderr)
-            self.assertEqual(calls, [])
-
-    def test_http_failures_curl_exit_and_stale_warning(self):
-        for market in ("en", "zh"):
-            with self.subTest(market=market):
-                for http in ("201", "503"):
-                    result, calls = self.run_breadth(market, http=http)
-                    self.assertEqual(result.returncode, 1)
-                    self.assertIn("::error::Breadth refresh failed", result.stdout)
-                    self.assertEqual(len(calls), 1)
-                result, calls = self.run_breadth(market, curl_exit="28")
-                self.assertEqual(result.returncode, 28)
-                self.assertEqual(len(calls), 1)
-                result, calls = self.run_breadth(market, stale=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("::warning::Upstream data is behind", result.stdout)
-                self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":
