@@ -219,44 +219,39 @@ def _fetch_symbol_closes_tencent(
     from akshare.utils import demjson
 
     tx_symbol = _tencent_symbol(symbol)
-    frames = []
-    # 只取本次窗口涉及的年份，避免 AKShare 上市日期探测中的无界请求。
-    for year in range(int(start_date[:4]), int(end_date[:4]) + 1):
-        params = {
-            "_var": f"kline_dayqfq{year}",
-            "param": f"{tx_symbol},day,{year}-01-01,{year + 1}-12-31,640,qfq",
-            "r": "0.8205512681390605",
-        }
-        with observe(
-            trace,
-            "source",
-            "history",
-            source="tencent",
-            unit="http_request",
-            symbol=symbol,
-            attempt=1,
-            year=year,
-        ):
-            response = session.get(
-                "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
-                params=params,
-                timeout=(5, 20),
-            )
-            response.raise_for_status()
-            data = demjson.decode(response.text[response.text.find("={") + 1 :])[
-                "data"
-            ][tx_symbol]
-            rows = data.get("day", data.get("hfqday", data.get("qfqday")))
-            if rows is None:
-                raise ValueError(f"Tencent history missing fields for {symbol}")
-            if rows:
-                frames.append(pd.DataFrame(rows).iloc[:, [0, 1, 2, 3, 4, 5, 7, 8]])
-            elif not frames and year == int(end_date[:4]):
-                raise ValueError(f"Tencent history missing rows for {symbol}")
-    if not frames:
-        raise ValueError(f"Tencent history missing rows for {symbol}")
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    count = (end - start).days + 1
+    params = {
+        "_var": "kline_dayqfq",
+        "param": f"{tx_symbol},day,,{end.isoformat()},{count},qfq",
+        "r": "0.8205512681390605",
+    }
+    with observe(
+        trace,
+        "source",
+        "history",
+        source="tencent",
+        unit="http_request",
+        symbol=symbol,
+        attempt=1,
+    ):
+        response = session.get(
+            "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
+            params=params,
+            timeout=(5, 20),
+        )
+        response.raise_for_status()
+        data = demjson.decode(response.text[response.text.find("={") + 1 :])["data"][
+            tx_symbol
+        ]
+        rows = data.get("day", data.get("hfqday", data.get("qfqday")))
+        if rows is None:
+            raise ValueError(f"Tencent history missing fields for {symbol}")
+        if not rows:
+            raise ValueError(f"Tencent history missing rows for {symbol}")
+        frame = pd.DataFrame(rows).iloc[:, [0, 1, 2, 3, 4, 5, 7, 8]]
     # 与固定 AKShare 版本在参与去重的八列上保持一致，再提取日期和收盘价。
-    frame = pd.concat(frames, ignore_index=True)
     frame.columns = [
         "date",
         "open",
