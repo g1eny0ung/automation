@@ -6,7 +6,7 @@ inputs:
     description: Market code, en or zh.
   date:
     required: true
-    description: Calendar date, today or yesterday.
+    description: Beijing date mode, today, yesterday, or breadth (producer refresh cutoff).
 outputs:
   should_run:
     value: ${{ steps.session.outputs.should_run }}

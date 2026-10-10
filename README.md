@@ -12,9 +12,9 @@
 | [刷新美股广度](.github/workflows/refresh-market-breadth-en.yml) | 周二至周六 10:17       | 昨天             |
 | [生成日报](.github/workflows/market-analysis.yml)               | 周二至周六 09:00 | 两个市场的昨天   |
 
-广度任务遇到休市就跳过。日报只有在两个市场都休市时才跳过。手动运行也按表中的日期检查。
+广度任务按实际执行时间选择日期：A 股 18:00 起检查今天，之前检查昨天；美股 08:00 起检查昨天，之前检查前天。因此 A 股任务延迟到次日凌晨运行时，仍检查前一天。手动运行遵循相同规则。
 
-只检查指定日期，不往前找交易日。例如，美股任务周六检查周五，周一检查周日并跳过。
+所选日期休市时，广度任务跳过，不往前找交易日。例如，美股任务周六 10:17 检查周五，周一 10:17 检查周日并跳过。日报始终检查两个市场的昨天，只有两个市场都休市时才跳过。
 
 当前A股节假日日历只覆盖到 2026 年。运行 2027 年的任务前，需要更新 [日历依赖](requirements-market-calendar.txt)。日历检查失败会停止任务。
 
@@ -68,10 +68,11 @@ uv pip install --python .venv/bin/python -r requirements-test.txt
 
 ```sh
 .venv/bin/python scripts/market_session.py zh --date today
+.venv/bin/python scripts/market_session.py zh --date breadth
 .venv/bin/python scripts/market_session.py en,zh --date yesterday
 ```
 
-`--date` 必填，`today` 表示今天，`yesterday` 表示昨天。复查某个时间的结果时，可加 `--now 2026-10-06T09:00:00+08:00`。
+`--date` 必填，`today` 表示今天，`yesterday` 表示昨天，`breadth` 按上述广度刷新时间选择日期。复查某个时间的结果时，可加 `--now 2026-10-06T09:00:00+08:00`。
 
 ## 本地实际取数
 

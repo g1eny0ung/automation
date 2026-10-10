@@ -191,22 +191,52 @@ class SessionTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
+    def test_delayed_china_workflow_checks_previous_evening(self):
+        session = next(step for step in steps(".github/workflows/refresh-market-breadth-zh.yml")
+                       if step.get("id") == "prepare")["with"]
+        with tempfile.TemporaryDirectory() as directory:
+            result, output = run_gate(Path(directory), session["market"], session["date"],
+                                      "2026-10-09T16:56:46+00:00")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout),
+                             {"market": "zh", "date": "2026-10-09", "status": "open"})
+            self.assertEqual(output, "should_run=true\n")
+
     def test_workflow_dates_control_actual_action_results(self):
-        for filename, expected in (
-            ("refresh-market-breadth-en.yml", {"market": "en", "date": "2026-10-07", "status": "open"}),
-            ("refresh-market-breadth-zh.yml", {"market": "zh", "date": "2026-10-08", "status": "open"}),
-            ("market-analysis.yml", [
-                {"market": "en", "date": "2026-10-07", "status": "open"},
-                {"market": "zh", "date": "2026-10-07", "status": "closed"},
-            ]),
+        for market, now, target, status in (
+            ("zh", "2026-10-09T18:07:00+08:00", "2026-10-09", "open"),
+            ("zh", "2026-10-09T17:59:59+08:00", "2026-10-08", "open"),
+            ("zh", "2026-10-09T18:00:00+08:00", "2026-10-09", "open"),
+            ("zh", "2026-10-10T18:07:00+08:00", "2026-10-10", "closed"),
+            ("zh", "2026-10-06T18:07:00+08:00", "2026-10-06", "closed"),
+            ("en", "2026-10-09T07:59:59+08:00", "2026-10-07", "open"),
+            ("en", "2026-10-09T08:00:00+08:00", "2026-10-08", "open"),
+            ("en", "2026-10-09T00:00:00+00:00", "2026-10-08", "open"),
+            ("en", "2026-10-10T10:17:00+08:00", "2026-10-09", "open"),
+            ("en", "2026-10-12T10:17:00+08:00", "2026-10-11", "closed"),
+            ("en", "2026-07-04T10:17:00+08:00", "2026-07-03", "closed"),
         ):
-            session = next(step for step in steps(f".github/workflows/{filename}") if step.get("id") in ("session", "prepare"))["with"]
-            for hour in ("07:59:59", "18:00:00"):
-                with self.subTest(workflow=filename, hour=hour), tempfile.TemporaryDirectory() as directory:
-                    result, output = run_gate(Path(directory), session.get("markets", session.get("market")), session["date"], f"2026-10-08T{hour}+08:00")
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(json.loads(result.stdout), expected)
-                    self.assertEqual(output, "should_run=true\n")
+            session = next(step for step in steps(f".github/workflows/refresh-market-breadth-{market}.yml")
+                           if step.get("id") == "prepare")["with"]
+            with self.subTest(market=market, now=now), tempfile.TemporaryDirectory() as directory:
+                result, output = run_gate(Path(directory), session["market"], session["date"], now)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"market": market, "date": target, "status": status})
+                self.assertEqual(output, f"should_run={str(status == 'open').lower()}\n")
+
+    def test_report_workflow_still_checks_yesterday_regardless_of_hour(self):
+        session = next(step for step in steps(".github/workflows/market-analysis.yml")
+                       if step.get("id") == "session")["with"]
+        for hour in ("07:59:59", "18:00:00"):
+            with self.subTest(hour=hour), tempfile.TemporaryDirectory() as directory:
+                result, output = run_gate(Path(directory), session["markets"], session["date"],
+                                          f"2026-10-08T{hour}+08:00")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), [
+                    {"market": "en", "date": "2026-10-07", "status": "open"},
+                    {"market": "zh", "date": "2026-10-07", "status": "closed"},
+                ])
+                self.assertEqual(output, "should_run=true\n")
 
     def test_actual_action_shell_all_market_combinations(self):
         for now, target, statuses, expected in (
@@ -252,8 +282,8 @@ class GateTests(unittest.TestCase):
 
     def test_workflows_connect_calendar_output_to_business_step(self):
         for filename, markets, selection, business_name, command in (
-            ("refresh-market-breadth-en.yml", "en", "yesterday", "Refresh cached breadth snapshot", "bash scripts/refresh-market-breadth.sh en"),
-            ("refresh-market-breadth-zh.yml", "zh", "today", "Refresh cached breadth snapshot", "bash scripts/refresh-market-breadth.sh zh"),
+            ("refresh-market-breadth-en.yml", "en", "breadth", "Refresh cached breadth snapshot", "bash scripts/refresh-market-breadth.sh en"),
+            ("refresh-market-breadth-zh.yml", "zh", "breadth", "Refresh cached breadth snapshot", "bash scripts/refresh-market-breadth.sh zh"),
             ("market-analysis.yml", "en,zh", "yesterday", "Generate market analysis report", None),
         ):
             with self.subTest(workflow=filename):

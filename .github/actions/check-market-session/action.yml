@@ -5,7 +5,7 @@ inputs:
     description: Comma-separated market codes on one line, en or zh.
     required: true
   date:
-    description: Target date in Beijing time, today or yesterday.
+    description: Beijing date mode, today, yesterday, or breadth (producer refresh cutoff).
     required: true
 outputs:
   should_run:
